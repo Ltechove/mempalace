@@ -1243,6 +1243,26 @@ class TestWriteTools:
         assert result["success"] is True
         assert result.get("noop") is True
 
+    def test_tool_create_tunnel_preserves_hyphenated_wings(self, monkeypatch, tmp_path):
+        """Regression for #1504: ``tool_create_tunnel`` stores the wing slug
+        verbatim, and both hyphen and underscore queries find the result."""
+        from mempalace import mcp_server, palace_graph
+
+        monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tmp_path / "tunnels.json"))
+
+        t = mcp_server.tool_create_tunnel(
+            source_wing="other-wing",
+            source_room="r1",
+            target_wing="my-wing",
+            target_room="r2",
+            label="hyphen preservation",
+        )
+
+        assert t["source"]["wing"] == "other-wing"
+        assert t["target"]["wing"] == "my-wing"
+        assert len(mcp_server.tool_list_tunnels(wing="my-wing")) == 1
+        assert len(mcp_server.tool_list_tunnels(wing="my_wing")) == 1
+
 
 # ── KG Tools ────────────────────────────────────────────────────────────
 
