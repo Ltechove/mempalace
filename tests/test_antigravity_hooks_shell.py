@@ -80,6 +80,26 @@ def _ensure_palace(home: Path) -> None:
     (home / ".mempalace").mkdir(parents=True, exist_ok=True)
 
 
+def _poll_log_contains(log_path: Path, needle: str, timeout: float = 5.0) -> bool:
+    """Poll a log file until it contains ``needle`` or the timeout elapses.
+
+    The save hook now writes mine/probe outcome lines from a detached
+    background subshell, so the foreground returns before those lines
+    are flushed. Callers that assert on background-written log lines
+    must poll rather than read once.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log_path.is_file():
+            body = log_path.read_text(errors="replace")
+            if needle in body:
+                return True
+        time.sleep(0.05)
+    return False
+
+
 def _stop_payload(**overrides) -> dict:
     base = {
         "executionNum": 1,
@@ -432,10 +452,12 @@ def test_save_hook_missing_mempalace_python_module_does_not_crash(tmp_path: Path
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "{}"
-    log_body = (state / "antigravity_hook.log").read_text(errors="replace")
-    assert "is not runnable via" in log_body, (
-        f"expected the new 'mempalace not runnable via $MEMPAL_PYTHON_BIN' log "
-        f"line; got:\n{log_body}"
+    # The "is not runnable" line is written by the detached background
+    # subshell now (the probe moved off the foreground), so poll for it.
+    log = state / "antigravity_hook.log"
+    assert _poll_log_contains(log, "is not runnable via"), (
+        f"expected the 'mempalace not runnable via $MEMPAL_PYTHON_BIN' log line; "
+        f"got:\n{log.read_text(errors='replace') if log.is_file() else '<no log>'}"
     )
 
 
@@ -461,29 +483,140 @@ def test_save_hook_uses_python_module_invocation(tmp_path: Path) -> None:
     )
 
 
-def test_save_hook_marker_watcher_uses_kill_polling(tmp_path: Path) -> None:
-    """The marker-cleanup watcher must use `kill -0` polling, not `wait`.
+def test_save_hook_backgrounds_probe_mine_and_cleanup_in_one_subshell(tmp_path: Path) -> None:
+    """Probe + mine + marker cleanup must live in ONE detached subshell.
 
-    bash `wait` only operates on direct children of the calling
-    shell. The watcher subshell `( ... ) &` runs as a SIBLING of the
-    mine pid, not its parent, so `wait $MINE_PID` fails immediately
-    with "not a child of this shell" and the marker would be deleted
-    within milliseconds — even while the mine is still running. The
-    correct primitive is `kill -0 $pid` which queries existence
-    regardless of parent-child relationship. Regression test for
-    gemini-code-assist review on PR #1633.
+    igorls' PR #1633 review: the foreground `mempalace --version`
+    probe pays the full chromadb/onnx cold-start import (the `mine`
+    subparser imports `mempalace.miner` before argparse handles
+    `--version`), which blows the save budget. Moving the probe into
+    the background subshell — together with the mine and the marker
+    cleanup — keeps the foreground instant.
+
+    Folding cleanup into the same subshell also retires the previous
+    `kill -0 $MINE_PID` watcher: the `rm -f "$PENDING_FILE"` runs
+    sequentially after the mine in the shell that owns it, so there is
+    no sibling-PID `wait`/`kill -0` hazard anymore. This test locks in
+    that structure.
     """
     body = SAVE_HOOK.read_text(encoding="utf-8")
-    assert 'kill -0 "$MINE_PID"' in body, (
-        "marker-cleanup watcher must poll with `kill -0 $MINE_PID`, not `wait`. "
-        "`wait` only operates on direct children; the sibling subshell would "
-        "error out and delete the marker prematurely."
-    )
-    # Defense-in-depth: ensure the buggy `wait "$MINE_PID"` is gone.
+    # The buggy sibling `wait` must stay gone.
     assert 'wait "$MINE_PID"' not in body, (
-        'buggy `wait "$MINE_PID"` still present in the watcher subshell. '
-        "POSIX wait cannot watch a sibling pid."
+        'buggy `wait "$MINE_PID"` reappeared. POSIX wait cannot watch a sibling pid.'
     )
+    # The kill -0 polling watcher is no longer needed and should be gone.
+    assert "kill -0" not in body, (
+        "the `kill -0` watcher should have been retired when probe+mine+cleanup "
+        "were folded into a single background subshell."
+    )
+    # Probe still happens (just inside the subshell now) and uses -m.
+    assert '"$MEMPAL_PYTHON_BIN" -m mempalace --version' in body, (
+        "the runnability probe must still run via $MEMPAL_PYTHON_BIN -m mempalace"
+    )
+    # The whole block is backgrounded: a subshell close followed by the
+    # detach redirection + `&`.
+    assert ") >/dev/null 2>&1 < /dev/null &" in body, (
+        "probe+mine+cleanup must be wrapped in a detached `( ... ) ... &` subshell"
+    )
+    # MINE_PID capture is no longer used (no separate watcher).
+    assert "MINE_PID=$!" not in body, (
+        "MINE_PID capture is vestigial now that there is no separate watcher"
+    )
+
+
+def test_save_hook_returns_before_slow_version_probe(tmp_path: Path) -> None:
+    """The hook must return immediately even if `--version` is slow.
+
+    Proves the probe was moved off the foreground. We point
+    MEMPAL_PYTHON at a stub that sleeps for 3s on any `-m mempalace`
+    invocation. If the probe still ran in the foreground the hook
+    would block ~3s; with the probe backgrounded it returns in well
+    under a second.
+    """
+    import time
+
+    state = tmp_path / "state"
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    stub = tmp_path / "slow_python"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "# Stub python: any -m mempalace call sleeps 3s, simulating a\n"
+        "# heavy cold-start import. Everything else proxies to python3.\n"
+        'case "$*" in\n'
+        '    *"-m mempalace"*) sleep 3; exit 0 ;;\n'
+        '    *) exec /usr/bin/env python3 "$@" ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    start = time.monotonic()
+    result = _run_hook(
+        SAVE_HOOK,
+        _stop_payload(transcriptPath=str(transcript)),
+        state_dir=state,
+        home=home,
+        extra_env={"MEMPAL_PYTHON": str(stub), "MEMPAL_SAVE_INTERVAL": "1"},
+        timeout=10.0,
+    )
+    elapsed = time.monotonic() - start
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "{}"
+    assert elapsed < 2.0, (
+        f"save hook took {elapsed:.2f}s with a 3s --version probe; the probe "
+        f"is still running in the foreground instead of the background subshell."
+    )
+
+
+def test_save_hook_counter_write_is_atomic(tmp_path: Path) -> None:
+    """Counter is written via mempal_write_counter_atomic (temp + mv).
+
+    igorls' PR #1633 review: the counter was written with a plain
+    `printf > file` (truncate-then-write) while the comment claimed it
+    was atomic. We verify (a) the source uses the atomic helper, not a
+    bare redirect into the counter file, (b) the counter still
+    increments correctly across fires, and (c) no temp file is left
+    behind.
+    """
+    body = SAVE_HOOK.read_text(encoding="utf-8")
+    assert 'mempal_write_counter_atomic "$COUNTER_FILE" "$COUNT"' in body, (
+        "save hook must write the counter via mempal_write_counter_atomic"
+    )
+    assert 'printf \'%s\' "$COUNT" > "$COUNTER_FILE"' not in body, (
+        "non-atomic `printf > $COUNTER_FILE` should have been replaced"
+    )
+
+    state = tmp_path / "state"
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    counter_path = state / "antigravity_save_count_test-conv-001"
+    for expected in (1, 2, 3):
+        result = _run_hook(
+            SAVE_HOOK,
+            _stop_payload(),
+            state_dir=state,
+            home=home,
+            extra_env={"MEMPAL_SAVE_INTERVAL": "999"},
+        )
+        assert result.returncode == 0
+        assert counter_path.read_text().strip() == str(expected)
+    # No leftover temp files from the atomic write.
+    temps = [
+        p.name
+        for p in state.iterdir()
+        if ".XXXXXX" in p.name or p.name.startswith("antigravity_save_count_test-conv-001.")
+    ]
+    assert not temps, f"atomic counter write left temp files behind: {temps}"
+
+
+def test_save_hook_helper_uses_temp_and_mv(tmp_path: Path) -> None:
+    """mempal_write_counter_atomic must use a temp file + mv (not a bare redirect)."""
+    body = COMMON_LIB.read_text(encoding="utf-8")
+    assert "mempal_write_counter_atomic()" in body
+    assert "mktemp" in body, "atomic counter helper should create a temp file via mktemp"
+    assert "mv -f" in body, "atomic counter helper should promote the temp with mv -f"
 
 
 def test_wake_hook_uses_sys_executable_module_invocation(tmp_path: Path) -> None:
@@ -664,24 +797,36 @@ def test_wake_hook_never_emits_decision_field(tmp_path: Path) -> None:
 
 
 def test_wake_hook_emits_empty_when_mempalace_missing(tmp_path: Path) -> None:
-    """When `mempalace` is not on PATH, the wake hook degrades to `{}`.
+    """When mempalace can't be run, the wake hook degrades to `{}`.
 
     Antigravity's hook framework should never see a stack trace from
     a missing CLI — emit `{}` and let the conversation start without
     injection.
+
+    Note: the wake hook binds the wake-up call to
+    ``[sys.executable, '-m', 'mempalace', ...]`` (the interpreter that
+    resolved MEMPAL_PYTHON), NOT a bare ``mempalace`` on PATH. So we
+    force MEMPAL_PYTHON="" (resolution falls back to ``python3`` on the
+    minimal PATH below) and strip PATH to a system python3 that has no
+    mempalace package installed. The inner ``python3 -m mempalace``
+    then fails and the hook must emit `{}`. We also override
+    MEMPAL_PYTHON explicitly so a value exported in the developer's
+    shell can't leak in and point at an interpreter that *does* have
+    mempalace.
     """
     state = tmp_path / "state"
     home = tmp_path / "home"
     _ensure_palace(home)
     # Strip PATH down to just the bash + python essentials, dropping
-    # any directory that might have a `mempalace` binary.
+    # any directory that might have a `mempalace` binary, and clear
+    # MEMPAL_PYTHON so resolution falls back to this minimal PATH.
     minimal_path = "/usr/bin:/bin"
     result = _run_hook(
         WAKE_HOOK,
         _wake_payload(),
         state_dir=state,
         home=home,
-        extra_env={"PATH": minimal_path},
+        extra_env={"PATH": minimal_path, "MEMPAL_PYTHON": ""},
     )
     assert result.returncode == 0, (
         f"wake hook crashed when mempalace is missing:\n"
@@ -788,4 +933,191 @@ def test_save_hook_returns_quickly_under_kill_switch(tmp_path: Path) -> None:
         f"save hook under kill switch took {elapsed:.3f}s; expected < 1.5s. "
         "A regression here usually means a synchronous import / DB connection "
         "is happening before the kill-switch short-circuit."
+    )
+
+
+# ── State-file GC (PR #1633 hygiene) ──────────────────────────────────
+
+
+def _backdate(path: Path, days: int) -> None:
+    """Set a path's atime/mtime ``days`` days into the past."""
+    import time
+
+    past = time.time() - days * 86400
+    os.utime(path, (past, past))
+
+
+def test_gc_removes_stale_state_files(tmp_path: Path) -> None:
+    """Stale per-conversation state (older than the TTL) is swept.
+
+    igorls' PR #1633 review flagged unbounded growth of
+    antigravity_save_count_*, antigravity_pending_*, and
+    antigravity_woke_* artifacts. mempal_gc_stale_state removes those
+    older than MEMPAL_STATE_TTL_DAYS (default 30).
+    """
+    state = tmp_path / "state"
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    state.mkdir(parents=True, exist_ok=True)
+
+    # Stale artifacts (40 days old) — all three shapes.
+    stale_count = state / "antigravity_save_count_old-conv"
+    stale_pending = state / "antigravity_pending_old-conv"
+    stale_woke = state / "antigravity_woke_old-conv"
+    stale_count.write_text("7", encoding="utf-8")
+    stale_pending.write_text("", encoding="utf-8")
+    stale_woke.mkdir()
+    for p in (stale_count, stale_pending, stale_woke):
+        _backdate(p, 40)
+
+    # Fresh artifacts must survive.
+    fresh_count = state / "antigravity_save_count_new-conv"
+    fresh_count.write_text("1", encoding="utf-8")
+
+    # Protected files must never be touched even when stale.
+    log = state / "antigravity_hook.log"
+    log.write_text("log line\n", encoding="utf-8")
+    _backdate(log, 99)
+
+    cmd = f". {COMMON_LIB}; mempal_gc_stale_state"
+    result = subprocess.run(
+        ["bash", "-c", cmd],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(home), "MEMPAL_STATE_DIR": str(state)},
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+    assert not stale_count.exists(), "stale counter file not swept"
+    assert not stale_pending.exists(), "stale pending marker not swept"
+    assert not stale_woke.exists(), "stale woke marker dir not swept"
+    assert fresh_count.exists(), "fresh counter file was wrongly swept"
+    assert log.exists(), "protected hook.log was swept (name glob too broad)"
+
+
+def test_gc_is_throttled_to_once_per_day(tmp_path: Path) -> None:
+    """A fresh antigravity_last_sweep marker (<24h) skips the sweep."""
+    state = tmp_path / "state"
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    state.mkdir(parents=True, exist_ok=True)
+
+    # Fresh sweep marker — GC should bail before touching anything.
+    marker = state / "antigravity_last_sweep"
+    marker.write_text("", encoding="utf-8")
+
+    stale_count = state / "antigravity_save_count_old-conv"
+    stale_count.write_text("7", encoding="utf-8")
+    _backdate(stale_count, 40)
+
+    cmd = f". {COMMON_LIB}; mempal_gc_stale_state"
+    result = subprocess.run(
+        ["bash", "-c", cmd],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(home), "MEMPAL_STATE_DIR": str(state)},
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    # Throttled: stale file should still be present.
+    assert stale_count.exists(), (
+        "GC ran despite a fresh antigravity_last_sweep marker; throttle failed"
+    )
+
+
+def test_gc_runs_when_marker_is_stale(tmp_path: Path) -> None:
+    """A stale antigravity_last_sweep marker (>24h) lets the sweep run."""
+    state = tmp_path / "state"
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    state.mkdir(parents=True, exist_ok=True)
+
+    marker = state / "antigravity_last_sweep"
+    marker.write_text("", encoding="utf-8")
+    _backdate(marker, 2)  # 2 days old -> stale
+
+    stale_count = state / "antigravity_save_count_old-conv"
+    stale_count.write_text("7", encoding="utf-8")
+    _backdate(stale_count, 40)
+
+    cmd = f". {COMMON_LIB}; mempal_gc_stale_state"
+    result = subprocess.run(
+        ["bash", "-c", cmd],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(home), "MEMPAL_STATE_DIR": str(state)},
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not stale_count.exists(), "stale counter not swept despite stale marker"
+
+
+def test_state_ttl_days_floors_and_strips(tmp_path: Path) -> None:
+    """mempal_state_ttl_days validates input like mempal_save_interval."""
+    home = tmp_path / "home"
+    _ensure_palace(home)
+
+    def ttl(value: str | None) -> str:
+        env = {**os.environ, "HOME": str(home)}
+        if value is None:
+            env.pop("MEMPAL_STATE_TTL_DAYS", None)
+        else:
+            env["MEMPAL_STATE_TTL_DAYS"] = value
+        out = subprocess.run(
+            ["bash", "-c", f". {COMMON_LIB}; mempal_state_ttl_days"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+        return out.stdout.strip()
+
+    assert ttl(None) == "30", "default TTL should be 30"
+    assert ttl("") == "30", "empty TTL falls back to 30"
+    assert ttl("abc") == "30", "garbage TTL falls back to 30"
+    assert ttl("7") == "7"
+    # Leading zeros must be stripped so `find -mtime +N` never sees octal-ish tokens.
+    assert ttl("007") == "7"
+    assert ttl("0") == "0"
+
+
+def test_save_hook_calls_gc(tmp_path: Path) -> None:
+    """The save hook wires mempal_gc_stale_state in and creates the sweep marker."""
+    body = SAVE_HOOK.read_text(encoding="utf-8")
+    assert "mempal_gc_stale_state" in body, "save hook must call mempal_gc_stale_state"
+
+    state = tmp_path / "state"
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    result = _run_hook(
+        SAVE_HOOK,
+        _stop_payload(),
+        state_dir=state,
+        home=home,
+        extra_env={"MEMPAL_SAVE_INTERVAL": "999"},
+    )
+    assert result.returncode == 0
+    assert (state / "antigravity_last_sweep").exists(), (
+        "save hook should have created the antigravity_last_sweep throttle marker"
+    )
+
+
+def test_gc_does_not_run_under_kill_switch(tmp_path: Path) -> None:
+    """When the kill switch trips, the save hook returns before GC runs."""
+    state = tmp_path / "state"
+    home = tmp_path / "home"
+    _ensure_palace(home)
+    result = _run_hook(
+        SAVE_HOOK,
+        _stop_payload(),
+        state_dir=state,
+        home=home,
+        extra_env={"MEMPAL_DISABLE_HOOK": "1"},
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "{}"
+    # GC runs after the kill-switch check, so no sweep marker is written.
+    assert not (state / "antigravity_last_sweep").exists(), (
+        "GC ran despite the kill switch being tripped"
     )

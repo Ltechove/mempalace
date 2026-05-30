@@ -305,6 +305,107 @@ mempal_save_interval() {
     printf '%s' "$raw"
 }
 
+# ── Atomic counter write ──────────────────────────────────────────────
+#
+# Writes $value to $file via a same-directory temp file + `mv -f`.
+# `mv` (rename) is atomic on a single filesystem, so a concurrent
+# reader either sees the old contents or the new contents — never a
+# half-written / truncated file. A plain `printf > file` truncates
+# first and then writes, leaving a window where a concurrent Stop fire
+# could read an empty / partial value. Concurrent fires for one
+# conversation are unlikely (Antigravity serializes turns) but the
+# previous "written atomically" comment was simply false; this makes
+# it true.
+#
+# bash 3.2 safe. The temp lives in the same directory as the target so
+# the rename stays on one filesystem (a cross-device mv would fall back
+# to copy+unlink and lose atomicity). On any failure we degrade to a
+# direct write rather than leaving the counter unwritten.
+mempal_write_counter_atomic() {
+    local file="$1"
+    local value="$2"
+    local tmp
+    tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || {
+        printf '%s' "$value" > "$file"
+        return
+    }
+    printf '%s' "$value" > "$tmp"
+    mv -f "$tmp" "$file" 2>/dev/null || {
+        rm -f "$tmp" 2>/dev/null
+        printf '%s' "$value" > "$file"
+    }
+}
+
+# ── State-file TTL ────────────────────────────────────────────────────
+#
+# Per-conversation state artifacts (antigravity_save_count_<conv>,
+# antigravity_pending_<conv>, antigravity_woke_<conv>/) accumulate one
+# set per conversation and are never otherwise removed. Reads
+# MEMPAL_STATE_TTL_DAYS (default 30), validated digits-only and
+# leading-zero-stripped like mempal_save_interval so `find -mtime`
+# never sees a bad token. A value of 0 means "sweep aggressively"
+# (everything older than today); we floor empty/garbage to 30.
+mempal_state_ttl_days() {
+    local raw="${MEMPAL_STATE_TTL_DAYS:-30}"
+    case "$raw" in
+        ''|*[!0-9]*) printf '30'; return 0 ;;
+    esac
+    while [ "${raw}" != "${raw#0}" ] && [ "${#raw}" -gt 1 ]; do
+        raw="${raw#0}"
+    done
+    printf '%s' "$raw"
+}
+
+# ── Stale state GC ────────────────────────────────────────────────────
+#
+# Opportunistic sweep of per-conversation state older than the TTL.
+# Gated to run at most once per 24h via the antigravity_last_sweep
+# marker so it costs nothing on the vast majority of fires (a single
+# mtime comparison). When it does run, three `find` passes remove the
+# stale counter files, pending markers, and woke marker directories.
+#
+# The name globs are specific (antigravity_save_count_*, _pending_*,
+# _woke_*), so the shared log files (antigravity_hook.log,
+# antigravity_last_input.log, antigravity_last_python_err.log) and the
+# antigravity_last_sweep marker itself are never touched. BSD find
+# (macOS default) and GNU find both accept `-maxdepth`, `-mtime +N`,
+# and `-exec ... +`.
+#
+# Fail-open: every step is best-effort; a missing state dir, a find
+# that errors, or a permission problem must never abort the caller.
+mempal_gc_stale_state() {
+    [ -d "$MEMPAL_STATE_DIR" ] || return 0
+
+    local marker="$MEMPAL_STATE_DIR/antigravity_last_sweep"
+    if [ -f "$marker" ]; then
+        local mtime now
+        if mtime=$(date -r "$marker" '+%s' 2>/dev/null) \
+           && now=$(date '+%s' 2>/dev/null) \
+           && [ -n "$mtime" ] \
+           && [ "$((now - mtime))" -lt 86400 ]; then
+            return 0
+        fi
+    fi
+    # Touch the marker first so a crash mid-sweep still throttles the
+    # next fire (better to skip a sweep than to hammer the disk).
+    : > "$marker" 2>/dev/null
+
+    local ttl
+    ttl=$(mempal_state_ttl_days)
+
+    find "$MEMPAL_STATE_DIR" -maxdepth 1 -type f \
+        -name 'antigravity_save_count_*' -mtime +"$ttl" \
+        -exec rm -f {} + 2>/dev/null
+    find "$MEMPAL_STATE_DIR" -maxdepth 1 -type f \
+        -name 'antigravity_pending_*' -mtime +"$ttl" \
+        -exec rm -f {} + 2>/dev/null
+    find "$MEMPAL_STATE_DIR" -maxdepth 1 -type d \
+        -name 'antigravity_woke_*' -mtime +"$ttl" \
+        -exec rm -rf {} + 2>/dev/null
+
+    return 0
+}
+
 # ── Fail-open emitters ────────────────────────────────────────────────
 #
 # Every code path in both hooks must terminate by calling exactly one

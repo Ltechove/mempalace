@@ -52,6 +52,13 @@ if mempal_kill_switch_tripped; then
     exit 0
 fi
 
+# ── Opportunistic GC of stale per-conversation state ─────────────────
+#
+# Self-throttled to at most once per 24h (see mempal_gc_stale_state),
+# so this is a single mtime check on the overwhelming majority of
+# fires. Runs after the kill switch so a disabled hook touches nothing.
+mempal_gc_stale_state
+
 # ── Parse stdin (camelCase, sentinel-guarded) ────────────────────────
 _parsed=$(mempal_parse_stdin "$INPUT")
 _marker=$(printf '%s\n' "$_parsed" | sed -n '1p')
@@ -114,10 +121,13 @@ fi
 
 # ── Increment counter (per conversation) ─────────────────────────────
 #
-# The counter is a single integer, written atomically. Concurrent Stop
-# fires for the same conversation are unlikely (Antigravity serializes
-# turns) but if they do happen the integer-only validation rejects any
-# garbled writes; one fire wins and the other reads 0 and re-counts.
+# The counter is a single integer, written via mempal_write_counter_atomic
+# (same-dir temp + `mv`, which is an atomic rename on one filesystem).
+# Concurrent Stop fires for the same conversation are unlikely
+# (Antigravity serializes turns), but the atomic write means a
+# concurrent reader always sees a complete value rather than a
+# half-written / truncated file. The integer-only validation on read
+# is a second guard: any garbled value resets the count to 0.
 COUNTER_FILE="$MEMPAL_STATE_DIR/antigravity_save_count_${CONVERSATION_ID}"
 COUNT=0
 if [ -f "$COUNTER_FILE" ]; then
@@ -128,7 +138,7 @@ if [ -f "$COUNTER_FILE" ]; then
     esac
 fi
 COUNT=$((COUNT + 1))
-printf '%s' "$COUNT" > "$COUNTER_FILE"
+mempal_write_counter_atomic "$COUNTER_FILE" "$COUNT"
 
 INTERVAL=$(mempal_save_interval)
 mempal_log "stop" "$CONVERSATION_ID" "count=$COUNT interval=$INTERVAL executionNum=$EXECUTION_NUM workspace=$WORKSPACE_PATH"
@@ -187,10 +197,24 @@ mempal_log "stop" "$CONVERSATION_ID" "TRIGGERING SAVE wing=$WING transcript_dir=
 # retry.
 : > "$PENDING_FILE" 2>/dev/null
 
-# Detach the mine subprocess. On POSIX, `nohup ... &` + redirection is
-# sufficient; the parent (this hook script) can exit and the child
-# reparents to init. Stdout and stderr both go to the antigravity hook
-# log so a wedged mine surfaces in one place.
+# Detach EVERYTHING heavy into a single background subshell: the
+# runnability probe, the mine itself, and the pending-marker cleanup.
+# The foreground returns immediately after spawning, so the hook's
+# stdout (`{}`) reaches Antigravity within milliseconds.
+#
+# Why the probe must NOT run in the foreground: `mempalace --version`
+# is NOT cheap. Building the `mine` argument parser imports
+# `mempalace.miner` (-> palace -> backends -> chromadb/onnx) before
+# argparse ever processes `--version`, so the probe pays the full
+# cold-start import cost. Running it in the foreground would block the
+# hook for that entire import and blow the <500ms save budget. Moving
+# it inside the backgrounded subshell keeps the foreground instant.
+#
+# Folding the cleanup into this same subshell also removes the need for
+# a separate process-liveness polling watcher: the `rm -f
+# "$PENDING_FILE"` simply runs after the mine returns, in the same
+# shell that owns the mine — no sibling-PID `wait` hazard, no polling
+# loop.
 #
 # We invoke mempalace as `"$MEMPAL_PYTHON_BIN" -m mempalace` rather than
 # the bare `mempalace` console script so a user with the package
@@ -199,41 +223,19 @@ mempal_log "stop" "$CONVERSATION_ID" "TRIGGERING SAVE wing=$WING transcript_dir=
 # managed virtualenv) still hits a working mine. MEMPAL_PYTHON honours
 # user override; sees ``mempalace/__main__.py`` which dispatches to
 # ``mempalace.cli:main`` — identical to the console script.
-if "$MEMPAL_PYTHON_BIN" -m mempalace --version >/dev/null 2>&1; then
-    nohup "$MEMPAL_PYTHON_BIN" -m mempalace mine "$TRANSCRIPT_DIR" \
-        --mode convos \
-        --wing "$WING" \
-        >> "$MEMPAL_AGY_LOG" 2>&1 < /dev/null &
-
-    MINE_PID=$!
-    mempal_log "stop" "$CONVERSATION_ID" "mine spawned pid=$MINE_PID wing=$WING"
-
-    # Schedule a marker-cleanup detach so the marker doesn't outlive a
-    # crashed mine. We can't `wait` here because:
-    #   (1) bash `wait` only operates on direct children of the
-    #       calling shell; the subshell `( ... ) &` below runs as a
-    #       SIBLING of MINE_PID, not its parent, so `wait $MINE_PID`
-    #       fails IMMEDIATELY with "not a child of this shell" and
-    #       the marker would be deleted within milliseconds — even
-    #       while the mine is still running.
-    #   (2) We can't use `wait` directly in the parent either,
-    #       because that would block the hook for the full mine
-    #       runtime and Antigravity would hang waiting for stdout.
-    # The portable fix is `kill -0 $pid` polling: signal 0 doesn't
-    # actually deliver a signal, it just queries whether the pid is
-    # alive (regardless of parent-child relationship). The inner
-    # subshell is detached so the hook returns immediately, and the
-    # marker is removed only AFTER the mine actually exits.
-    (
-        while kill -0 "$MINE_PID" 2>/dev/null; do
-            sleep 1
-        done
-        rm -f "$PENDING_FILE" 2>/dev/null
-    ) >/dev/null 2>&1 < /dev/null &
-else
-    mempal_log "stop" "$CONVERSATION_ID" "ERROR: mempalace is not runnable via $MEMPAL_PYTHON_BIN -m mempalace; install mempalace or set MEMPAL_PYTHON"
+mempal_log "stop" "$CONVERSATION_ID" "spawning background mine wing=$WING transcript_dir=$TRANSCRIPT_DIR"
+(
+    if "$MEMPAL_PYTHON_BIN" -m mempalace --version >/dev/null 2>&1; then
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$TRANSCRIPT_DIR" \
+            --mode convos \
+            --wing "$WING" \
+            >> "$MEMPAL_AGY_LOG" 2>&1 < /dev/null
+        mempal_log "stop" "$CONVERSATION_ID" "background mine finished wing=$WING"
+    else
+        mempal_log "stop" "$CONVERSATION_ID" "ERROR: mempalace is not runnable via $MEMPAL_PYTHON_BIN -m mempalace; install mempalace or set MEMPAL_PYTHON"
+    fi
     rm -f "$PENDING_FILE" 2>/dev/null
-fi
+) >/dev/null 2>&1 < /dev/null &
 
 # ── Always emit `{}` ─────────────────────────────────────────────────
 #
